@@ -33,6 +33,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 UPSTREAM = "https://api.anthropic.com"
 OTEL_ENDPOINT = "http://localhost:4318"
+ATTR_LLM_MODEL = "llm.model"
 
 resource = Resource.create({"service.name": "claude-code-proxy"})
 
@@ -90,6 +91,12 @@ def extract_text(content) -> str:
 
 
 class LoggingProxy(BaseHTTPRequestHandler):
+    def handle(self):
+        try:
+            super().handle()
+        except ConnectionResetError:
+            pass  # client disconnected before sending a full request — benign
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
@@ -100,10 +107,10 @@ class LoggingProxy(BaseHTTPRequestHandler):
             parsed = {}
 
         model = parsed.get("model", "unknown")
-        attrs = {"llm.model": model}
+        attrs = {ATTR_LLM_MODEL: model}
 
         with tracer.start_as_current_span("llm.request") as span:
-            span.set_attribute("llm.model", model)
+            span.set_attribute(ATTR_LLM_MODEL, model)
             span.set_attribute("llm.path", self.path)
 
             if "system" in parsed:
@@ -111,7 +118,7 @@ class LoggingProxy(BaseHTTPRequestHandler):
                 span.set_attribute("llm.system_prompt", system_text[:1000])
                 logger.info(
                     "llm.system_prompt",
-                    extra={"llm.model": model, "llm.system": system_text[:4000]},
+                    extra={ATTR_LLM_MODEL: model, "llm.system": system_text[:4000]},
                 )
 
             for msg in parsed.get("messages", []):
@@ -120,7 +127,7 @@ class LoggingProxy(BaseHTTPRequestHandler):
                 span.set_attribute(f"llm.{role}", text[:1000])
                 logger.info(
                     f"llm.message.{role}",
-                    extra={"llm.role": role, "llm.content": text[:4000], "llm.model": model},
+                    extra={"llm.role": role, "llm.content": text[:4000], ATTR_LLM_MODEL: model},
                 )
 
             # Forward to Anthropic
@@ -133,39 +140,59 @@ class LoggingProxy(BaseHTTPRequestHandler):
                 UPSTREAM + self.path, data=body, headers=headers, method="POST"
             )
 
+            is_streaming = parsed.get("stream", False)
             start = time.time()
             try:
                 with urllib.request.urlopen(req) as resp:
-                    resp_body = resp.read()
                     latency_ms = (time.time() - start) * 1000
-
-                    try:
-                        usage = json.loads(resp_body).get("usage", {})
-                        input_tokens = usage.get("input_tokens", 0)
-                        output_tokens = usage.get("output_tokens", 0)
-                        token_counter.add(input_tokens, {**attrs, "llm.token_type": "input"})
-                        token_counter.add(output_tokens, {**attrs, "llm.token_type": "output"})
-                        span.set_attribute("llm.input_tokens", input_tokens)
-                        span.set_attribute("llm.output_tokens", output_tokens)
-                        logger.info(
-                            "llm.response",
-                            extra={
-                                "llm.model": model,
-                                "llm.input_tokens": input_tokens,
-                                "llm.output_tokens": output_tokens,
-                            },
-                        )
-                    except Exception:
-                        pass
-
-                    latency_histogram.record(latency_ms, attrs)
-                    request_counter.add(1, {**attrs, "status": "success"})
-
                     self.send_response(resp.status)
                     for k, v in resp.headers.items():
                         self.send_header(k, v)
                     self.end_headers()
-                    self.wfile.write(resp_body)
+
+                    if is_streaming:
+                        # Pipe SSE chunks directly so Claude Code receives them in real time
+                        input_tokens = output_tokens = 0
+                        while True:
+                            chunk = resp.read(4096)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            # Collect token usage from the final [DONE] message if present
+                            try:
+                                for line in chunk.decode(errors="ignore").splitlines():
+                                    if line.startswith("data:") and line != "data: [DONE]":
+                                        event = json.loads(line[5:].strip())
+                                        u = event.get("usage") or {}
+                                        input_tokens += u.get("input_tokens", 0)
+                                        output_tokens += u.get("output_tokens", 0)
+                            except Exception:
+                                pass
+                    else:
+                        resp_body = resp.read()
+                        self.wfile.write(resp_body)
+                        try:
+                            usage = json.loads(resp_body).get("usage", {})
+                            input_tokens = usage.get("input_tokens", 0)
+                            output_tokens = usage.get("output_tokens", 0)
+                        except Exception:
+                            input_tokens = output_tokens = 0
+
+                    token_counter.add(input_tokens, {**attrs, "llm.token_type": "input"})
+                    token_counter.add(output_tokens, {**attrs, "llm.token_type": "output"})
+                    span.set_attribute("llm.input_tokens", input_tokens)
+                    span.set_attribute("llm.output_tokens", output_tokens)
+                    latency_histogram.record(latency_ms, attrs)
+                    request_counter.add(1, {**attrs, "status": "success"})
+                    logger.info(
+                        "llm.response",
+                        extra={
+                            ATTR_LLM_MODEL: model,
+                            "llm.input_tokens": input_tokens,
+                            "llm.output_tokens": output_tokens,
+                        },
+                    )
 
             except urllib.error.HTTPError as e:
                 latency_ms = (time.time() - start) * 1000
@@ -183,4 +210,13 @@ if __name__ == "__main__":
     server = HTTPServer(("localhost", 8888), LoggingProxy)
     print(f"Proxy listening on http://localhost:8888")
     print(f"Sending telemetry to {OTEL_ENDPOINT}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    finally:
+        server.shutdown()
+        tracer_provider.shutdown()
+        meter_provider.shutdown()
+        logger_provider.shutdown()
+        print("Telemetry flushed. Bye.")
