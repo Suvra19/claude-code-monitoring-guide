@@ -13,7 +13,6 @@ Then in another terminal:
 
 import json
 import logging
-import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -59,12 +58,6 @@ meter = metrics.get_meter("claude-code-proxy")
 
 request_counter = meter.create_counter(
     "llm.requests", description="Total LLM requests"
-)
-token_counter = meter.create_counter(
-    "llm.tokens", description="Token usage by type"
-)
-latency_histogram = meter.create_histogram(
-    "llm.request.duration_ms", description="Request latency in milliseconds"
 )
 
 # Logs
@@ -140,63 +133,21 @@ class LoggingProxy(BaseHTTPRequestHandler):
                 UPSTREAM + self.path, data=body, headers=headers, method="POST"
             )
 
-            is_streaming = parsed.get("stream", False)
-            start = time.time()
             try:
                 with urllib.request.urlopen(req) as resp:
-                    latency_ms = (time.time() - start) * 1000
                     self.send_response(resp.status)
                     for k, v in resp.headers.items():
                         self.send_header(k, v)
                     self.end_headers()
-
-                    if is_streaming:
-                        # Pipe SSE chunks directly so Claude Code receives them in real time
-                        input_tokens = output_tokens = 0
-                        while True:
-                            chunk = resp.read(4096)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                            self.wfile.flush()
-                            # Collect token usage from the final [DONE] message if present
-                            try:
-                                for line in chunk.decode(errors="ignore").splitlines():
-                                    if line.startswith("data:") and line != "data: [DONE]":
-                                        event = json.loads(line[5:].strip())
-                                        u = event.get("usage") or {}
-                                        input_tokens += u.get("input_tokens", 0)
-                                        output_tokens += u.get("output_tokens", 0)
-                            except Exception:
-                                pass
-                    else:
-                        resp_body = resp.read()
-                        self.wfile.write(resp_body)
-                        try:
-                            usage = json.loads(resp_body).get("usage", {})
-                            input_tokens = usage.get("input_tokens", 0)
-                            output_tokens = usage.get("output_tokens", 0)
-                        except Exception:
-                            input_tokens = output_tokens = 0
-
-                    token_counter.add(input_tokens, {**attrs, "llm.token_type": "input"})
-                    token_counter.add(output_tokens, {**attrs, "llm.token_type": "output"})
-                    span.set_attribute("llm.input_tokens", input_tokens)
-                    span.set_attribute("llm.output_tokens", output_tokens)
-                    latency_histogram.record(latency_ms, attrs)
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
                     request_counter.add(1, {**attrs, "status": "success"})
-                    logger.info(
-                        "llm.response",
-                        extra={
-                            ATTR_LLM_MODEL: model,
-                            "llm.input_tokens": input_tokens,
-                            "llm.output_tokens": output_tokens,
-                        },
-                    )
 
             except urllib.error.HTTPError as e:
-                latency_ms = (time.time() - start) * 1000
-                latency_histogram.record(latency_ms, attrs)
                 request_counter.add(1, {**attrs, "status": str(e.code)})
                 self.send_response(e.code)
                 self.end_headers()
@@ -208,7 +159,7 @@ class LoggingProxy(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = HTTPServer(("localhost", 8888), LoggingProxy)
-    print(f"Proxy listening on http://localhost:8888")
+    print("Proxy listening on http://localhost:8888")
     print(f"Sending telemetry to {OTEL_ENDPOINT}")
     try:
         server.serve_forever()
